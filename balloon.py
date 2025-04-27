@@ -8,7 +8,7 @@ class Balloon:
     gasConstant = 1.380622 * 6.022169
 
     def __init__(self, mass, gas, diameter, dragCoefficient, parachuteDragCoefficient, parachuteCrossSection):
-        Balloon.balloons += 1
+        #Balloon.balloons += 1
         self.mass = mass
         self.gas = gas
         self.diameter = diameter

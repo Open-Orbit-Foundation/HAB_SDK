@@ -1,4 +1,5 @@
 import numpy as np
+import bisect
 
 class standardAtmosphere:
     segments = [0, 11000, 20000, 32000, 47000, 51000, 71000, 84852]
@@ -55,3 +56,10 @@ class standardAtmosphere:
     def Density(self, pressure, temperature):
         density = pressure * standardAtmosphere.mixedMolecularWeight / (standardAtmosphere.gasConstant * temperature)
         return density
+    
+    def _Qualities(self, geometricAltitude):
+        i = bisect.bisect(self.segments, geometricAltitude) - 1
+        pressure = self.Pressure(i, geometricAltitude)
+        temperature = self.Temperature(i, geometricAltitude)
+        density = self.Density(pressure, temperature)
+        return pressure, density
