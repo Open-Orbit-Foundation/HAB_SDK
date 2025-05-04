@@ -55,6 +55,7 @@ class Model:
             pressure, temperature, density, gravity = profile.atmosphere._Qualities(altitudes[-1])
             pressures = [pressure]
             velocity = [0]
+            acceleration = [0]
             times = [0]
             balloon_drag_coefficient = profile.balloon.drag_coefficient
             parachute_drag_coefficient = profile.payload.parachute_drag_coefficient
@@ -96,10 +97,13 @@ class Model:
                 k4_x = v + dt * k3_v
                 v_new = v + (dt / 6.0) * (k1_v + 2 * k2_v + 2 * k3_v + k4_v)
                 alt_new = alt + (dt / 6.0) * (k1_x + 2 * k2_x + 2 * k3_x + k4_x)
-                return alt_new, v_new
+                return alt_new, v_new, accel_func(alt_new, v_new)
 
             while volume < burst_volume:
-                alt_new, v_new = rk4_update(altitudes[-1], velocity[-1], self.time_step, ascent_accel)
+                alt_new, v_new, a_new = rk4_update(altitudes[-1], velocity[-1], self.time_step, ascent_accel)
+                if alt_new <= altitudes[-1]:
+                    break
+                acceleration.append(a_new)
                 velocity.append(v_new)
                 altitudes.append(alt_new)
                 times.append(times[-1] + self.time_step)
@@ -107,7 +111,8 @@ class Model:
                 volume = gas_moles * self.gas_const * temperature / pressure / 1000  # m^3
                 pressures.append(pressure)
             while altitudes[-1] >= altitudes[0]:  
-                alt_new, v_new = rk4_update(altitudes[-1], velocity[-1], self.time_step, descent_accel)
+                alt_new, v_new, a_new = rk4_update(altitudes[-1], velocity[-1], self.time_step, descent_accel)
+                acceleration.append(a_new)
                 velocity.append(v_new)
                 altitudes.append(alt_new)
                 times.append(times[-1] + self.time_step)
