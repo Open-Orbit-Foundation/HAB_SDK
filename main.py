@@ -1,4 +1,4 @@
-from model import LaunchSite, Balloon, Payload, MissionProfile, Model
+from model_new import LaunchSite, Balloon, Payload, MissionProfile, Model
 from atmosphere import standardAtmosphere
 import numpy as np
 import time
@@ -10,10 +10,10 @@ launch_sites = [
 ]
 
 balloons = [
-    Balloon(0.6, 19.8 * 0.3048, 0.55, "Helium", 1.5 / 0.3048 ** 3),
-    Balloon(0.35, 19.8 * 0.3048, 0.55, "Helium", 1.2 / 0.3048 ** 3),
-    Balloon(0.6, 19.8 * 0.3048, 0.55, "Helium", 1.2 / 0.3048 ** 3),
-    Balloon(0.35, 19.8 * 0.3048, 0.55, "Helium", 1 / 0.3048 ** 3)
+    Balloon(0.6, 19.8 * 0.3048, 0.55, "Helium", 1.5),
+    Balloon(0.35, 19.8 * 0.3048, 0.55, "Helium", 1.2),
+    Balloon(0.6, 19.8 * 0.3048, 0.55, "Helium", 1.2),
+    Balloon(0.35, 19.8 * 0.3048, 0.55, "Helium", 1)
 ]
 
 payloads = [
@@ -31,7 +31,7 @@ mission_profiles = [
 flight_profiles = []
 
 start = time.perf_counter()
-Model(0.5, mission_profiles, flight_profiles).altitude_model()
+Model(1, mission_profiles, flight_profiles).altitude_model()
 end = time.perf_counter()
 print(f"Compute Time: {round(end - start, 2)}")
 
