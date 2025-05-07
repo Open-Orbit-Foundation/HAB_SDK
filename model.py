@@ -1,8 +1,9 @@
-from utils import Geometry, Integrator
+from utils import Geometry, Integrator, Utility
 from dataclasses import dataclass
 from functools import partial
 import numpy as np
 import math
+import time
 
 @dataclass(frozen=False)
 class LaunchSite:
@@ -80,8 +81,12 @@ class Model:
                     drag_force = 0.5 * 0.5 * density * velocity ** 2 * profile.payload.parachute_drag_coefficient * (profile.payload.parachute_diameter ** 2 * math.pi / 4) * np.sign(velocity)
                 return buoyant_force - weight_force - drag_force
     
-    def altitude_model(self):
-        for profile in self.profiles:
+    def altitude_model(self, logging: bool):
+        start = time.perf_counter()
+        for i, profile in enumerate(self.profiles):
+            padding = len(f" Modelling {len(self.profiles)} Profiles ...")
+            Utility.progress_bar(i, len(self.profiles), prefix=f" Modelling {len(self.profiles)} Profiles ...".ljust(padding), suffix="Complete", bar_length=100) if logging else None
+            print() if logging else None
             times = [0]
             altitudes = [profile.launch_site.altitude]
             velocities = [0]
@@ -109,6 +114,8 @@ class Model:
                 densities.append(density)
                 gravities.append(gravity)
                 volume = profile.balloon.gas_moles * (1.380622 * 6.022169) * temperature / pressure / 1000
+                Utility.progress_bar(volume, burst_volume, prefix=f"Ascent ...".rjust(padding), suffix="Complete", bar_length=100) if logging else None
+            print() if logging else None
             while altitudes[-1] >= altitudes[0]:
                 altitude, velocity, acceleration = Integrator.rk4_second_order(altitudes[-1], velocities[-1], partial(self._acceleration, profile = profile, ascent = False), self.time_step)
                 accelerations.append(acceleration)
@@ -121,6 +128,10 @@ class Model:
                 temperatures.append(temperature)
                 densities.append(density)
                 gravities.append(gravity)
+                Utility.progress_bar(altitudes[0], altitudes[-1], prefix=f"Descent ...".rjust(padding), suffix="Complete", bar_length=100) if logging else None
+            print(f"\x1B[2F\r\x1B[J\x1B[1F") if logging else None
             self.result.append(FlightProfile(profile.atmosphere, profile.launch_site, profile.balloon, profile.payload, 
                                              times, altitudes, velocities, accelerations, forces, 
                                              pressures, temperatures, densities, gravities))
+        end = time.perf_counter()
+        Utility.progress_bar(1, 1, prefix=f" Modelling {len(self.profiles)} Profiles ...".ljust(padding), suffix=f"Complete in {end - start:.2f} seconds\n", bar_length=100) if logging else print(f"Compute Time: {round(end - start, 2)}")

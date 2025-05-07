@@ -58,7 +58,7 @@ def print_progress_bar(current, total, prefix='', suffix='', bar_length=100):
     bar = '#' * completed + '-' * (bar_length - completed)
     print(f'\r{prefix} |{bar}| {current}/{total} {suffix}', end='', flush=True)
 
-duration = 10_000.0  # total time (s)
+duration = 1_000.0  # total time (s)
 x0, dx0 = 1.0, 0.0
 k_base, gamma_base = 0.1, 0.3
 methods = ['rk1_second_order', 'rk2_second_order', 'rk4_second_order']

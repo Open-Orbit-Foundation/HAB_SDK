@@ -1,7 +1,6 @@
 from model import LaunchSite, Balloon, Payload, MissionProfile, Model
 from atmosphere import standardAtmosphere
 import numpy as np
-import time
 import matplotlib.pyplot as plt
 import matplotlib.ticker as tic
 
@@ -30,10 +29,7 @@ mission_profiles = [
 
 flight_profiles = []
 
-start = time.perf_counter()
-Model(1, mission_profiles, flight_profiles).altitude_model()
-end = time.perf_counter()
-print(f"Compute Time: {round(end - start, 2)}")
+Model(1, mission_profiles, flight_profiles).altitude_model(True)
 
 fig, ax = plt.subplots(figsize = (12, 9))
 for i, profile in enumerate(flight_profiles):

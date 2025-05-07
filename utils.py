@@ -1,4 +1,5 @@
 import math
+import sys
 
 class Integrator:
     @staticmethod
@@ -73,3 +74,11 @@ class Physics:
     
     def acceleration(F, m):
         return F / m
+
+class Utility:
+    @staticmethod 
+    def progress_bar(current, total, prefix='', suffix='', bar_length=100):
+        fraction = current / total
+        completed = int(bar_length * fraction)
+        bar = '#' * completed + '-' * (bar_length - completed)
+        sys.stdout.write(f'\r{prefix} |{bar}| {current / total * 100:.0f}% {suffix}')
