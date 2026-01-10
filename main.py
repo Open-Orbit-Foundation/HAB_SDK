@@ -1,12 +1,14 @@
-from model import LaunchSite, Balloon, Payload, MissionProfile, Model
+from model import LaunchSite, Balloon, Payload, MissionProfile#, Model
 import run
 import numpy as np
 import pandas as pd
 import time
 from functools import partial
-from concurrent.futures import ProcessPoolExecutor
+from atmosphere import standardAtmosphere
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import matplotlib.pyplot as plt
 import matplotlib.ticker as tic
+import sys
 
 def extract_attributes(obj, prefix=""):
     attributes = {}
@@ -31,183 +33,235 @@ def profiles_to_dataframe(profiles):
     profile_df.set_index("Profile ID", inplace=True)
     return profile_df
 
-def calculate_avg_velocities(profile):
-    velocities = profile["velocities"]
-    altitudes = profile["altitudes"]
-    ascent_velocities = [v for v, _ in zip(velocities, altitudes) if v > 0]
-    descent_velocities = [v for v, _ in zip(velocities, altitudes) if v < 0]
-    avg_ascent = sum(ascent_velocities) / len(ascent_velocities) if ascent_velocities else float('nan')
-    avg_descent = sum(descent_velocities) / len(descent_velocities) if descent_velocities else float('nan')
-    return pd.Series([avg_ascent, avg_descent], index=["avg_ascent", "avg_descent"])
+def mp_progress(done, total, start, bar_len=60):
+    frac = done / total if total else 1.0
+    filled = int(bar_len * frac)
+    bar = "#" * filled + "-" * (bar_len - filled)
+    elapsed = time.perf_counter() - start
+    rate = done / elapsed if elapsed > 0 else 0.0
+    eta = (total - done) / rate if rate > 0 else float("inf")
+    sys.stdout.write(f"\rProcessing {total} profiles... |{bar}| {done:>5}/{total}  ({100*frac:>3.0f}%)  "
+                     f"{rate:>5.2f} profiles/s  ETA {eta:>6.1f}s   ")
+    sys.stdout.flush()
+
+def chunked_indexed(profiles, chunk_size: int):
+    """Yield lists of (idx, profile) of length <= chunk_size."""
+    batch = []
+    for i, p in enumerate(profiles):
+        batch.append((i, p))
+        if len(batch) >= chunk_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 if __name__ == "__main__":
-    launch_sites = [
-        LaunchSite(1400)
-    ]
+    launch_site = LaunchSite(0.0)  # MSL reference for the chart
 
-    balloons = [
-        #Balloon(0.60, 6.03504, 0.55, "Helium", 1),
-        Balloon(0.60, 6.03504, 0.55, "Helium", 2.12376)#, #75 cuft
-        #Balloon(0.15, 2.52, 0.55, "Helium", 0.9),
-        #Balloon(0.20, 3.00, 0.55, "Helium", 1.0),
-        #Balloon(0.30, 3.78, 0.55, "Helium", 1.2),
-        #Balloon(0.35, 4.12, 0.55, "Helium", 1.3),
-        #Balloon(0.60, 6.02, 0.55, "Helium", 1.5),
-        #Balloon(0.80, 7.00, 0.55, "Helium", 1.7),
-        #Balloon(1.00, 7.86, 0.55, "Helium", 1.9),
-        #Balloon(1.20, 8.63, 0.55, "Helium", 2.1),
-        #Balloon(1.50, 9.44, 0.55, "Helium", 2.3),
-        #Balloon(1.60, 9.71, 0.55, "Helium", 2.5),
-        #Balloon(1.80, 9.98, 0.55, "Helium", 2.7),
-        #Balloon(2.00, 10.54, 0.55, "Helium", 2.9),
-        #Balloon(3.00, 13.00, 0.55, "Helium", 4.0),
-        #Balloon(4.00, 15.06, 0.55, "Helium", 5.0)
-    ]
+    # --- Sweep ranges (first take; adjust after you see the envelope) ---
+    fill_volumes = np.linspace(0, 500, 101)            # ft^3
+    suspended_masses = np.linspace(0, 10, 101)         # kg
 
-    '''for i in np.logspace(0,1,501):
-        balloons.append(Balloon(0.35, 4.12, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(0.60, 6.02, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(0.80, 7.00, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(1.00, 7.86, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(1.20, 8.63, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(1.50, 9.44, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(1.60, 9.71, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(1.80, 9.98, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(2.00, 10.54, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(3.00, 13.00, 0.55, "Helium", i))
-    for i in np.logspace(0,1,501):
-        balloons.append(Balloon(4.00, 15.06, 0.55, "Helium", i))'''
+    mission_profiles = []
 
-    payloads = [
-        Payload(0.822, 3 * 0.3048, 0.97) #2.1 lb Rocketman profile
-    ]
+    for m_payload in suspended_masses:
+        for v_fill in fill_volumes:
+            b = Balloon(0.60, 6.02, 0.55, "Helium", float(v_fill))  #Kaymont 600g
+            #b = Balloon(0.80, 7.00, 0.55, "Helium", float(v_fill))  #Kaymont 800g
+            #b = Balloon(1.00, 7.86, 0.55, "Helium", float(v_fill))  #Kaymont 1000g
+            #b = Balloon(1.20, 8.63, 0.55, "Helium", float(v_fill))  #Kaymont 1200g
+            #b = Balloon(1.50, 9.44, 0.55, "Helium", float(v_fill))  #Kaymont 1500g
+            #b = Balloon(2.00, 10.54, 0.55, "Helium", float(v_fill)) #Kaymont 2000g
+            #b = Balloon(3.00, 13.00, 0.55, "Helium", float(v_fill)) #Kaymont 3000g
+            p = Payload(m_payload, 4 * 0.3048, 0.5)
+            mission_profiles.append(MissionProfile(launch_site, b, p))
 
-    mission_profiles = [
-        MissionProfile(launch_sites[0], balloons[0], payloads[0])#,
-        #MissionProfile(launch_sites[0], balloons[1], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[2], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[3], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[4], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[5], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[6], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[7], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[8], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[9], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[10], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[11], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[12], payloads[0]),
-        #MissionProfile(launch_sites[0], balloons[13], payloads[0])
-    ]
+    #flight_profiles = []
 
-    '''for i in range(len(balloons)):
-        mission_profiles.append(MissionProfile(launch_sites[0], balloons[i], payloads[0]))'''
+    flight_profiles = [None] * len(mission_profiles)
+
+    # ---- BATCHED MULTIPROCESSING ----
+    dt = 0.15
+    max_workers = 16
+
+    # start with 20–50; tune later
+    CHUNK_SIZE = 25
+
+    batches = list(chunked_indexed(mission_profiles, CHUNK_SIZE))
+    total = len(mission_profiles)
+    done = 0
+
+    '''mission_profiles = [MissionProfile(
+        LaunchSite(1422), 
+        Balloon(0.60, 6.02, 0.55, "Helium", 125), 
+        Payload(1.5, 4 * 0.3048, 0.5)
+    )]
 
     flight_profiles = []
 
     start = time.perf_counter()
-    Model(0.1, mission_profiles, flight_profiles).altitude_model(True, 10) #RK4 < 1.5 (5.48s), RK2 < 1.1 (5.16s), RK1 < 1.0 (4.49s)
-    #After Updates on 5/19: RK4 < 1.5 (4.18s), RK2 < 1.1 (3.59s), RK1 < 1.0 (2.90s)
+    Model(0.1, mission_profiles, flight_profiles).altitude_model(True, 1)
     end= time.perf_counter()
-    print(f"Singleprocessing {int(len(mission_profiles))} Profiles in {end - start:.2f} seconds.")
+    print(f"Singleprocessing {int(len(mission_profiles))} Profiles in {end - start:.2f} seconds.")'''
 
-    '''start = time.perf_counter()
-    with ProcessPoolExecutor(max_workers = 8) as executor:
-        flight_profiles = list(executor.map(partial(run.predictor, dt = 0.4, logging = False, interval = 10), range(len(mission_profiles)), mission_profiles))
+    start = time.perf_counter()
+    mp_progress(0, total, start)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        submit = partial(run.predictor_batch, dt=dt, logging=False, interval=100)
+        futures = [executor.submit(submit, batch) for batch in batches]
+        for fut in as_completed(futures):
+            pairs = fut.result()  # list[(idx, FlightProfile|None)]
+            for idx, prof in pairs:
+                flight_profiles[idx] = prof
+            done += len(pairs)
+            mp_progress(done, total, start)
     end= time.perf_counter()
-    print(f"Multiprocessing {int(len(mission_profiles))} Profiles in {end - start:.2f} seconds.")'''
+    sys.stdout.write("\033[?25h\n")
+    sys.stdout.flush()
+    print(f"Multiprocessing {total} Profiles in {end - start:.2f} seconds.")
 
-    df = profiles_to_dataframe(flight_profiles)
-    '''Index(['accelerations', 'altitudes', 'balloon.burst_diameter',
-        'balloon.drag_coefficient', 'balloon.gas', 'balloon.gas_moles',
-        'balloon.gas_volume', 'balloon.mass', 'burst_altitude', 'burst_time',
-        'densities', 'flight_time', 'forces', 'gravities',
-        'launch_site.altitude', 'max_altitude', 'payload.mass',
-        'payload.parachute_diameter', 'payload.parachute_drag_coefficient',
-        'pressures', 'temperatures', 'times',
-        'velocities'],
-        dtype='object')'''
+    # Build dataframe (handles nested attrs like balloon.gas_volume, payload.mass, etc.)
+    df = profiles_to_dataframe([p for p in flight_profiles if p is not None])
 
-    burst_altitudes = df[["burst_altitude"]]
-    print(burst_altitudes)
+    # Add reference-average ascent rate (MSL, USSA76): vbar0 = z_burst / t_burst
+    # (Only defined when burst_time is finite & > 0)
+    df["vbar0_mps"] = df["burst_altitude"] / df["burst_time"]
 
-    burst_times = df[["burst_time"]]
+    # Mark "successful burst" runs
+    df["ok_burst"] = df["burst_altitude"].notna() & df["burst_time"].notna() & (df["burst_time"] > 0)
 
-    gas_volumes = df[["balloon.gas_volume"]]
+    # A sanity filter for numerical blow-ups (keeps plots stable)
+    # You can tighten/loosen these once you see real envelopes.
+    df["sane"] = (
+        df["ok_burst"]
+        & np.isfinite(df["vbar0_mps"])
+        & (df["vbar0_mps"] > 0)
+        & (df["vbar0_mps"] < 20)          # ascent rate should not be anywhere near 20 m/s in normal HAB ops
+        & (df["burst_altitude"] > 1000)   # ignore trivial "burst" near ground
+        & (df["burst_altitude"] < 60000)  # ignore pathological overshoots
+    )
 
-    #max_altitudes = df[["max_altitude"]]
-    #print(max_altitudes)
+    df_plot = df.loc[df["sane"]].copy()
 
-    final_velocities = df["velocities"].apply(lambda v: v[-1])
-    print(final_velocities)
+    print(f"Total profiles: {len(df)}")
+    print(f"Successful bursts: {df['ok_burst'].sum()}")
+    print(f"Plotted (sane): {len(df_plot)}")
 
-    # Apply the function to each row in the DataFrame
-    average_velocities = df.apply(calculate_avg_velocities, axis=1)
+    # --- Compute initial net force at launch (neutral buoyancy boundary) ---
+    atm = standardAtmosphere()
+    launch_alt = float(df["launch_site.altitude"].iloc[0])  # should be 0 for your chart
 
-    # Add the result to the summary DataFrame
-    df[["avg_ascent", "avg_descent"]] = average_velocities
+    p0, T0, rho0, g0 = atm._Qualities(launch_alt)
 
-    # Display the updated DataFrame
-    print(df[["avg_ascent", "avg_descent"]])
+    R_u = (1.380622 * 6.022169)  # same constant used in model.py
+    # Volume at launch from moles under ambient conditions (match your model's formula)
+    V0_m3 = df["balloon.gas_moles"] * R_u * T0 / p0 / 1000.0
 
-    fig, ax = plt.subplots(figsize = (12, 9))
-    for i, profile in enumerate(flight_profiles):
-        ax.plot(np.array(profile.times) / 3600, np.array(profile.altitudes) / 1000, label = f"Profile {i + 1}")
-        ax.set_xlabel("Time (hr)")
-        ax.xaxis.set_major_locator(tic.MultipleLocator(1))
-        ax.xaxis.set_minor_locator(tic.AutoMinorLocator(5))
-        ax.set_ylabel("Altitude (km)")
-        ax.yaxis.set_major_locator(tic.MultipleLocator(5))
-        ax.yaxis.set_minor_locator(tic.AutoMinorLocator(5))
-    plt.title("RK4 Interial Model Altitude Profile(s)")
-    plt.legend()
-    plt.grid(True, which='both', linestyle='--')
+    # Helium mass (kg) — same as in model
+    m_He = df["balloon.gas_moles"] * 4.002602 / 1000.0
+
+    m_total = df["payload.mass"] + df["balloon.mass"] + m_He
+
+    Fnet0 = rho0 * g0 * V0_m3 - m_total * g0            # N
+    a0 = Fnet0 / m_total                                 # m/s^2
+
+    # Keep only finite points for contouring
+    mask0 = np.isfinite(a0) & np.isfinite(df["payload.mass"]) & np.isfinite(df["balloon.gas_volume"])
+    x0 = df.loc[mask0, "payload.mass"].to_numpy()
+    y0 = df.loc[mask0, "balloon.gas_volume"].to_numpy()   # ft^3 in your current convention
+    a0v = a0.loc[mask0].to_numpy()
+
+    # --- Now build the plot (your existing contours) ---
+    # Use df_plot for performance contours (burst altitude & vbar0), but use df (incl failures) for the infeasible shading
+    x = df_plot["payload.mass"].to_numpy()
+    y = df_plot["balloon.gas_volume"].to_numpy()
+    z_alt_km = (df_plot["burst_altitude"] / 1000).to_numpy()
+    z_vbar = df_plot["vbar0_mps"].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # 1) Shade infeasible region: a0 < 0 (initial downward acceleration)
+    # Use a few levels so tricontourf can fill; the important boundary is 0.
+    min_a = np.nanmin(a0v)
+    levels_fill = [min_a, 0.0]
+    ax.tricontourf(x0, y0, a0v, levels=levels_fill, alpha=0.18)
+
+    # 2) Neutral buoyancy boundary: a0 = 0 (this is the curve you asked for)
+    c0 = ax.tricontour(x0, y0, a0v, levels=[0.0], linewidths=2.2)
+    ax.clabel(c0, fmt={0.0: "a₀ = 0"}, inline=True, fontsize=9)
+
+    # 3) Your existing performance contours (burst altitude solid, vbar dashed)
+    alt_levels = np.arange(np.floor(z_alt_km.min()), np.ceil(z_alt_km.max()) + 0.1, 1.0)  # 1 km
+    v_levels = np.arange(np.floor(z_vbar.min()), np.ceil(z_vbar.max()) + 0.1, 0.5)        # 0.5 m/s
+
+    cs1 = ax.tricontour(x, y, z_alt_km, levels=alt_levels, linewidths=1.5)
+    ax.clabel(cs1, fmt="%.0f km", inline=True, fontsize=8)
+
+    cs2 = ax.tricontour(x, y, z_vbar, levels=v_levels, linestyles="--", linewidths=1.0, alpha=0.9)
+    ax.clabel(cs2, fmt="%.1f m/s", inline=True, fontsize=8)
+
+    ax.set_title("Design Space (MSL, USSA76): Payload vs Fill\nContours: Burst Altitude (solid), $\\bar{v}_0$ (dashed), Neutral Buoyancy Boundary (bold)")
+    ax.set_xlabel("Payload mass (kg)")
+    ax.set_ylabel("Helium fill volume (ft³)")  # adjust if you change units later
+
+    ax.xaxis.set_minor_locator(tic.AutoMinorLocator())
+    ax.yaxis.set_minor_locator(tic.AutoMinorLocator())
+    ax.grid(True, which="both", linestyle="--", alpha=0.5)
+    plt.tight_layout()
     plt.show()
 
-    fig, ax = plt.subplots(figsize = (12, 9))
-    ax.plot(np.array(gas_volumes), np.array(burst_altitudes) / 1000, label = "burst altitudes")
-    ax.set_xlabel("Gas Volume (m^3)")
-    ax.xaxis.set_major_locator(tic.MultipleLocator(1))
-    ax.xaxis.set_minor_locator(tic.AutoMinorLocator(5))
-    ax.set_ylabel("Altitude (km)")
-    ax.yaxis.set_major_locator(tic.MultipleLocator(5))
-    ax.yaxis.set_minor_locator(tic.AutoMinorLocator(5))
-    plt.title("Burst Altitude Sweep")
-    plt.legend()
-    plt.grid(True, which='both', linestyle='--')
-    plt.show()
+    '''fp = flight_profiles[-1]
 
-    fig, ax = plt.subplots(figsize = (12, 9))
-    ax.plot(np.array(burst_times) / 3600, np.array(burst_altitudes) / 1000, label = "burst altitudes")
-    ax.set_xlabel("Time (hr)")
-    ax.set_xlim(0, 12)
-    ax.xaxis.set_major_locator(tic.MultipleLocator(1))
-    ax.xaxis.set_minor_locator(tic.AutoMinorLocator(5))
-    ax.set_ylabel("Altitude (km)")
-    ax.yaxis.set_major_locator(tic.MultipleLocator(5))
-    ax.yaxis.set_minor_locator(tic.AutoMinorLocator(5))
-    plt.title("Burst Altitude Sweep")
-    plt.legend()
-    plt.grid(True, which='both', linestyle='--')
-    plt.show()
+    t = np.asarray(fp.times, dtype=float)
+    alt = np.asarray(fp.altitudes, dtype=float)
 
-    fig, ax = plt.subplots()
-    for i, profile in enumerate(flight_profiles):
-        ax.plot(np.array(profile.times) / 3600, np.array(profile.pressures) * 10, label = f"Profile {i + 1}")
-        ax.set_xlabel("Time (hr)")
-        ax.xaxis.set_major_locator(tic.MultipleLocator(1))
-        ax.xaxis.set_minor_locator(tic.AutoMinorLocator(5))
-        ax.set_ylabel("Pressure (hPa)")
-        ax.set_yscale('log')
-    plt.title("RK4 Interial Model Pressure Profile(s)")
+    vel = np.asarray(fp.velocities, dtype=float)      # shape (N,3)
+
+    lat = np.asarray(fp.latitudes, dtype=float)
+    lon = np.asarray(fp.longitudes, dtype=float)
+
+    # ----- derived quantities -----
+    vz = vel[:, 2]
+    vxy = np.linalg.norm(vel[:, :2], axis=1)
+    v3 = np.linalg.norm(vel, axis=1)
+
+    # burst markers (if available)
+    burst_alt = fp.burst_altitude
+    burst_t = fp.burst_time
+    has_burst = np.isfinite(burst_alt) and np.isfinite(burst_t)
+
+    # ----- Plot 1: Altitude vs time -----
+    plt.figure()
+    plt.plot(t/60.0, alt)
+    if has_burst:
+        plt.axvline(burst_t/60.0, linestyle="--")
+        plt.title(f"Altitude vs Time (burst @ {burst_t/60.0:.1f} min, {burst_alt:.0f} m)")
+    else:
+        plt.title("Altitude vs Time (no burst recorded)")
+    plt.xlabel("Time (min)")
+    plt.ylabel("Altitude (m)")
+    plt.grid(True)
+
+    # ----- Plot 2: Speeds vs time -----
+    plt.figure()
+    plt.plot(t/60.0, vz, label="Vertical Speed V_z (m/s)")
+    plt.plot(t/60.0, vxy, label="Horizontal Speed |V_xy| (m/s)")
+    plt.plot(t/60.0, v3, label="Total Speed |V| (m/s)")
+    if has_burst:
+        plt.axvline(burst_t/60.0, linestyle="--")
+    plt.xlabel("Time (min)")
+    plt.ylabel("Speed (m/s)")
+    plt.title("Velocity Components")
+    plt.grid(True)
     plt.legend()
-    plt.grid(True, which='both', linestyle='--')
-    plt.show()
+
+    # ----- Plot 3: Ground track (lon/lat) -----
+    plt.figure()
+    lon_plot = ((lon + 180.0) % 360.0) - 180.0
+    plt.plot(lon_plot, lat)
+    plt.xlabel("Longitude (deg)")
+    plt.ylabel("Latitude (deg)")
+    plt.title("Ground Track")
+    plt.grid(True)
+
+    plt.show()'''

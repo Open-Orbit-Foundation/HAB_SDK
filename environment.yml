@@ -1,0 +1,70 @@
+name: herbie
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - pip
+  - rclone # Not used by Herbie, useful if you are downloading data (https://rclone.org/)
+
+  - herbie-data
+
+  #==============
+  # Dependencies
+  #==============
+  - curl
+  - cartopy>=0.22
+  - cfgrib>=0.9.10.4
+  - dask
+  - eccodes
+  - geos
+  - matplotlib>=3.5.3
+  - metpy
+  - netcdf4
+  - numpy>=1.25
+  - pandas>=2.0
+  - pygrib>=2.1.4
+  - pylint
+  - pyproj>=3.6
+  - requests>=2.31
+  - s3fs
+  - scikit-learn
+  - toml
+  #- wgrib2 # ONLY AVAILABLE ON LINUX. Uncomment if you want this optional dependency.
+  - jupyter
+  - jupyterlab
+  - xarray>=2023.7
+  - zarr
+
+  - pip:
+      # Borrow some tools from my garage
+      - git+https://github.com/blaylockbk/Carpenter_Workshop.git
+
+#==============================================================================
+#                               Notes
+#==============================================================================
+# Being more specific with versions *may* help speed up conda
+# creating/updating environments
+# https://www.anaconda.com/blog/understanding-and-improving-condas-performance
+
+
+
+# =============================================================================
+#                              Conda Tips
+# =============================================================================
+# To create this environment
+#
+#     curl -O https://raw.githubusercontent.com/blaylockbk/Herbie/main/environment.yml
+#     conda env create -f environment.yml
+#
+# To update this environment
+#
+#     conda env update -f environment.yml --prune
+#
+# To remove this environment
+#
+#     conda env remove --name herbie
+#
+# To do a conda clean
+#
+#     conda clean -tp
+# =============================================================================
