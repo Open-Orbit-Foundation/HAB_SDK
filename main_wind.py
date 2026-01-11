@@ -4,6 +4,8 @@ from hrrr_wind import HRRRWind
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import contextily as cx
+from pyproj import Transformer
 
 def extract_attributes(obj, prefix=""):
     attributes = {}
@@ -57,7 +59,7 @@ if __name__ == "__main__":
         sample_time_bin_s=60.0,
         sample_alt_bin_m=100.0,
         sample_latlon_decimals=6,
-        verbose=True
+        verbose=False
     )
 
     flight_profiles_gfs = []
@@ -93,7 +95,7 @@ if __name__ == "__main__":
     g = extract(fp_gfs)
     h = extract(fp_hyb)
 
-    def wrap180(deg):
+    '''def wrap180(deg):
         return (deg + 180.0) % 360.0 - 180.0
 
     heading_g = wrap180(np.degrees(np.arctan2(g["vel"][:,1], g["vel"][:,0])))
@@ -106,42 +108,87 @@ if __name__ == "__main__":
     plt.ylabel("Heading (deg, E=0, N=90)")
     plt.title("Horizontal Velocity Heading Comparison")
     plt.grid(True)
-    plt.legend()
+    plt.legend()'''
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
 
     # ----- Plot 1: Altitude vs time -----
-    plt.figure()
-    plt.plot(g["t"]/60.0, g["alt"], label="GFS")
-    plt.plot(h["t"]/60.0, h["alt"], label="HRRR → GFS", linestyle="--")
-    plt.xlabel("Time (min)")
-    plt.ylabel("Altitude (m)")
-    plt.title("Altitude vs Time")
-    plt.grid(True)
-    plt.legend()
+    ax = axs[0,0]
+    ax.plot(g["t"]/60.0, g["alt"], label="GFS")
+    ax.plot(h["t"]/60.0, h["alt"], label="HRRR → GFS", linestyle="--")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Altitude (m)")
+    ax.set_title("Altitude vs Time")
+    ax.grid(True)
+    ax.legend()
 
     # ----- Plot 2: Speeds vs time -----
-    plt.figure()
-    plt.plot(g["t"]/60.0, g["vz"], label="GFS Vz")
-    plt.plot(h["t"]/60.0, h["vz"], label="HRRR→GFS Vz", linestyle="--")
-    plt.plot(g["t"]/60.0, g["vxy"], label="GFS |Vxy|")
-    plt.plot(h["t"]/60.0, h["vxy"], label="HRRR→GFS |Vxy|", linestyle="--")
-    plt.xlabel("Time (min)")
-    plt.ylabel("Speed (m/s)")
-    plt.title("Velocity Components Comparison")
-    plt.grid(True)
-    plt.legend()
+    ax = axs[0,1]
+    ax.plot(g["t"]/60.0, g["vz"], label="GFS Vz")
+    ax.plot(h["t"]/60.0, h["vz"], label="HRRR→GFS Vz", linestyle="--")
+    ax.plot(g["t"]/60.0, g["vxy"], label="GFS |Vxy|")
+    ax.plot(h["t"]/60.0, h["vxy"], label="HRRR→GFS |Vxy|", linestyle="--")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Speed (m/s)")
+    ax.set_title("Velocity Components")
+    ax.grid(True)
+    ax.legend()
 
-    # ----- Plot 3: Ground track (lon/lat) -----
-    plt.figure()
+    # ----- Plot 3: Ground track with OSM basemap, lat/lon axes -----
+    ax = axs[1,0]
+
     g_lon = ((g["lon"] + 180.0) % 360.0) - 180.0
     h_lon = ((h["lon"] + 180.0) % 360.0) - 180.0
-    plt.plot(g_lon, g["lat"], label="GFS")
-    plt.plot(h_lon, h["lat"], label="HRRR → GFS", linestyle="--")
-    plt.xlabel("Longitude (deg)")
-    plt.ylabel("Latitude (deg)")
-    plt.title("Ground Track Comparison")
-    plt.grid(True)
-    plt.legend()
 
+    ax.plot(g_lon, g["lat"], label="GFS", linewidth=2.0)
+    ax.plot(h_lon, h["lat"], label="HRRR → GFS", linestyle="--", linewidth=2.0)
+
+    all_lon = np.concatenate([g_lon, h_lon])
+    all_lat = np.concatenate([g["lat"], h["lat"]])
+
+    pad_frac = 0.08
+
+    lon_span = np.ptp(all_lon)
+    lat_span = np.ptp(all_lat)
+
+    ax.set_xlim(all_lon.min() - pad_frac * lon_span,
+                all_lon.max() + pad_frac * lon_span)
+    ax.set_ylim(all_lat.min() - pad_frac * lat_span,
+                all_lat.max() + pad_frac * lat_span)
+
+    cx.add_basemap(
+        ax,
+        crs="EPSG:4326",
+        source=cx.providers.OpenStreetMap.Mapnik,
+        attribution_size=6,
+    )
+
+    ax.set_title("Ground Track (OSM)")
+    ax.set_xlabel("Longitude (deg)")
+    ax.set_ylabel("Latitude (deg)")
+    ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.4)
+    ax.set_axisbelow(True)
+    ax.legend()
+
+    u_g = np.asarray(fp_gfs.wind_u)
+    v_g = np.asarray(fp_gfs.wind_v)
+    u_h = np.asarray(fp_hyb.wind_u)
+    v_h = np.asarray(fp_hyb.wind_v)
+
+    spd_g = np.sqrt(u_g*u_g + v_g*v_g)
+    spd_h = np.sqrt(u_h*u_h + v_h*v_h)
+
+    # ----- Plot 4: Wind speed vs altitude -----
+    ax = axs[1,1]
+    ax.plot(spd_g, g["alt"], label="GFS wind speed")
+    ax.plot(spd_h, h["alt"], label="HRRR wind speed", linestyle="--")
+    ax.set_xlabel("Wind speed (m/s)")
+    ax.set_ylabel("Altitude (m)")
+    ax.set_title("Wind Speed vs Altitude")
+    ax.grid(True)
+    ax.legend()
+
+    plt.tight_layout()
     plt.show()
 
     def haversine_km(lat1, lon1, lat2, lon2):

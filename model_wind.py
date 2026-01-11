@@ -57,6 +57,8 @@ class FlightProfile(MissionProfile):
     temperatures: list[float]
     densities: list[float]
     gravities: list[float]
+    wind_u: list[float]   # east (m/s)
+    wind_v: list[float]   # north (m/s)
     burst_altitude: float
     max_altitude: float
     burst_time: float
@@ -81,15 +83,21 @@ class Model:
     # Core 3-DOF acceleration
     # -------------------------
 
-    def _acceleration(self, r, v, profile, mass, current_time, lat, lon, Cd, area, buoyant: bool):
+    def _acceleration(self, r, v, profile, mass, current_time, lat, lon, x_prev, y_prev, Cd, area, buoyant: bool):
         x, y, z = r
         vx, vy, vz = v
+
+        dx = x - x_prev
+        dy = y - y_prev
+
+        lat_new = lat + math.degrees(dy / R_E)
+        lon_new = lon + math.degrees(dx / (R_E * math.cos(math.radians(lat_new))))
 
         pressure, temperature, density, gravity = self.atmosphere._Qualities(z)
 
         # Wind (east, north)
         if self.wind:
-            u_wind, v_wind = self.wind.uv(current_time, z, lat, lon)
+            u_wind, v_wind = self.wind.uv(current_time, z, lat_new, lon_new)
         else:
             u_wind = v_wind = 0.0
 
@@ -146,6 +154,8 @@ class Model:
             temperatures = []
             densities = []
             gravities = []
+            wind_u = []
+            wind_v = []
 
             ascent_mass = (
                 profile.payload.mass
@@ -160,6 +170,11 @@ class Model:
 
             t = 0.0
             x_prev = y_prev = 0.0
+
+            current_time = (self.run_time_utc if self.run_time_utc else None)
+            u_wind, v_wind = self.wind.uv(current_time, r[2], lat, lon) if self.wind else (0.0, 0.0)
+            wind_u.append(float(u_wind))
+            wind_v.append(float(v_wind))
 
             while True:
                 current_time = (
@@ -208,6 +223,8 @@ class Model:
                     current_time=current_time,
                     lat=lat,
                     lon=lon,
+                    x_prev=x_prev,
+                    y_prev=y_prev,
                     Cd=Cd,
                     area=area,
                     buoyant=buoyant
@@ -218,14 +235,19 @@ class Model:
                 # Update geographic coordinates
                 dx = r[0] - x_prev
                 dy = r[1] - y_prev
-                lat_rad = math.radians(lat)
 
-                lat += math.degrees(dy / R_E)
-                lon += math.degrees(dx / (R_E * math.cos(lat_rad)))
+                lat_new = lat + math.degrees(dy / R_E)
+                lon_new = lon + math.degrees(dx / (R_E * math.cos(math.radians(lat_new))))
+                lat, lon = lat_new, lon_new
 
                 x_prev, y_prev = r[0], r[1]
 
                 t += self.time_step
+
+                current_time_next = (self.run_time_utc + timedelta(seconds=t)) if self.run_time_utc else None
+                u_wind, v_wind = self.wind.uv(current_time_next, r[2], lat, lon) if self.wind else (0.0, 0.0)
+                wind_u.append(float(u_wind))
+                wind_v.append(float(v_wind))
 
                 times.append(t)
                 latitudes.append(lat)
@@ -254,6 +276,8 @@ class Model:
                     temperatures,
                     densities,
                     gravities,
+                    wind_u,
+                    wind_v,
                     float('nan') if burst_altitude is None else burst_altitude,
                     float(np.max(altitudes)),
                     float('nan') if burst_time is None else burst_time,
