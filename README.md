@@ -12,7 +12,7 @@ The SDK is structured to support future extensions, including alternative atmosp
 
 This project uses **Miniforge + conda-forge** to ensure reliable builds for geospatial and GRIB libraries.
 
-Download and install **Miniforge3 (Windows x86_64)**: https://conda-forge.org/download/
+Download and install **Miniforge3 (Windows x86_64)**: https://conda-forge.org/miniforge/
 
 ```powershell
 git clone https://github.com/Open-Orbit-Foundation/HAB_SDK.git
