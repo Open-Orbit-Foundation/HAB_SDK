@@ -7,3 +7,27 @@ The core solver implements a three-degree-of-freedom (3-DOF) inertial flight mod
 Multiple model fidelities are supported within a shared numerical framework. A wind-free (altitude-only) configuration is retained for baseline verification and rapid design-space exploration, while a wind-coupled configuration enables higher-fidelity trajectory prediction and mission analysis. Both configurations share the same integrator, atmospheric model, and vehicle dynamics logic, allowing direct comparison and incremental validation.
 
 The SDK is structured to support future extensions, including alternative atmospheric data sources, additional vehicle configurations, and integration with real flight data or high-altitude platform testing workflows.
+
+## Quick Start (Windows)
+
+This project uses **Miniforge + conda-forge** to ensure reliable builds for geospatial and GRIB libraries.
+
+Download and install **Miniforge3 (Windows x86_64)**: https://conda-forge.org/download/
+
+```powershell
+git clone https://github.com/Open-Orbit-Foundation/HAB_SDK.git
+mamba env create -f environment.yml
+conda activate hab-sdk
+python main.py
+```
+
+### Rebuilding the Environment
+
+If the environment becomes corrupted:
+
+```powershell
+conda deactivate
+conda env remove -n hab-sdk
+mamba env create -f environment.yml
+conda activate hab-sdk
+```
