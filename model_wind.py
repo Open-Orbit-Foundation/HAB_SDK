@@ -314,7 +314,7 @@ class Model:
             step_count = 0
 
             viability_check_time = 300.0
-            viability_min_gain = 250.0
+            viability_min_gain = 150.0
 
             burst_volume = (4 / 3) * math.pi * (profile.balloon.burst_diameter / 2) ** 3
             burst_altitude = None
