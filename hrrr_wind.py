@@ -9,6 +9,9 @@ import threading
 import numpy as np
 from herbie import Herbie
 
+import xarray as xr
+xr.set_options(use_new_combine_kwarg_defaults=True)
+
 # --- Constants ---
 R_USSA = 6356766.0  # US Standard Atmosphere 1976 Earth radius (m)
 

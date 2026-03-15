@@ -9,6 +9,9 @@ import numpy as np
 from herbie import Herbie
 import threading
 
+import xarray as xr
+xr.set_options(use_new_combine_kwarg_defaults=True)
+
 # USSA geopotential reference Earth radius (m)
 R_USSA = 6_356_766.0
 
