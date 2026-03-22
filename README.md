@@ -27,7 +27,11 @@ If the environment becomes corrupted:
 
 ```powershell
 conda deactivate
-conda env remove -n hab-sdk
+mamba env remove -n hab-sdk
+
+# fallback cleanup (important on Windows)
+Remove-Item -Recurse -Force "$env:USERPROFILE\miniforge3\envs\hab-sdk" -ErrorAction SilentlyContinue
+
 mamba env create -f environment.yml
 conda activate hab-sdk
 ```

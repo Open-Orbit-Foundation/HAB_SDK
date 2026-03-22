@@ -86,6 +86,26 @@ class FlightProfile(MissionProfile):
     burst_time: float
     flight_time: float
 
+@dataclass(frozen=False)
+class GroundNode:
+    latitude: float
+    longitude: float
+    altitude: Optional[float] = None
+    name: str = "Ground Node"
+
+
+@dataclass(frozen=False)
+class NodeObservationProfile:
+    node_name: str
+    node_latitude: float
+    node_longitude: float
+    node_altitude: float
+    flight_profile_index: int
+    launch_time_utc: datetime | str
+    times: list[float]
+    ranges_m: list[float]
+    azimuths_deg: list[float]
+    elevations_deg: list[float]
 
 class ConstantTerrain:
     def __init__(self, elevation_m: float):
@@ -198,6 +218,136 @@ class ETOPO1Terrain:
         )
 
         return float(z)
+
+WGS84_A = 6378137.0
+WGS84_F = 1.0 / 298.257223563
+WGS84_E2 = WGS84_F * (2.0 - WGS84_F)
+
+
+def geodetic_to_ecef(lat_deg: float, lon_deg: float, alt_m: float) -> np.ndarray:
+    lat = math.radians(float(lat_deg))
+    lon = math.radians(float(lon_deg))
+    alt = float(alt_m)
+
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+
+    N = WGS84_A / math.sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat)
+
+    x = (N + alt) * cos_lat * cos_lon
+    y = (N + alt) * cos_lat * sin_lon
+    z = (N * (1.0 - WGS84_E2) + alt) * sin_lat
+    return np.array([x, y, z], dtype=float)
+
+
+def ecef_to_enu_matrix(lat_deg: float, lon_deg: float) -> np.ndarray:
+    lat = math.radians(float(lat_deg))
+    lon = math.radians(float(lon_deg))
+
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+
+    return np.array([
+        [-sin_lon,              cos_lon,               0.0],
+        [-sin_lat * cos_lon,   -sin_lat * sin_lon,     cos_lat],
+        [ cos_lat * cos_lon,    cos_lat * sin_lon,     sin_lat],
+    ], dtype=float)
+
+
+def slant_range_az_el(
+    observer_lat_deg: float,
+    observer_lon_deg: float,
+    observer_alt_m: float,
+    target_lat_deg: float,
+    target_lon_deg: float,
+    target_alt_m: float,
+):
+    observer_ecef = geodetic_to_ecef(observer_lat_deg, observer_lon_deg, observer_alt_m)
+    target_ecef = geodetic_to_ecef(target_lat_deg, target_lon_deg, target_alt_m)
+
+    los_ecef = target_ecef - observer_ecef
+    enu = ecef_to_enu_matrix(observer_lat_deg, observer_lon_deg) @ los_ecef
+
+    east = float(enu[0])
+    north = float(enu[1])
+    up = float(enu[2])
+
+    horizontal = math.hypot(east, north)
+    slant_range = float(np.linalg.norm(enu))
+    azimuth_deg = (math.degrees(math.atan2(east, north)) + 360.0) % 360.0
+    elevation_deg = math.degrees(math.atan2(up, horizontal))
+
+    return slant_range, azimuth_deg, elevation_deg
+
+
+def resolve_node_altitude(node: GroundNode, terrain) -> float:
+    if node.altitude is not None:
+        return float(node.altitude)
+    return float(terrain.elevation(node.latitude, node.longitude))
+
+
+def compute_node_observations(
+    flight_profile: FlightProfile,
+    node: GroundNode,
+    terrain,
+    flight_profile_index: int,
+) -> NodeObservationProfile:
+    node_altitude = resolve_node_altitude(node, terrain)
+
+    ranges_m = []
+    azimuths_deg = []
+    elevations_deg = []
+
+    for lat, lon, alt in zip(
+        flight_profile.latitudes,
+        flight_profile.longitudes,
+        flight_profile.altitudes,
+    ):
+        r, az, el = slant_range_az_el(
+            observer_lat_deg=node.latitude,
+            observer_lon_deg=node.longitude,
+            observer_alt_m=node_altitude,
+            target_lat_deg=lat,
+            target_lon_deg=lon,
+            target_alt_m=alt,
+        )
+        ranges_m.append(float(r))
+        azimuths_deg.append(float(az))
+        elevations_deg.append(float(el))
+
+    return NodeObservationProfile(
+        node_name=node.name,
+        node_latitude=float(node.latitude),
+        node_longitude=float(node.longitude),
+        node_altitude=float(node_altitude),
+        flight_profile_index=int(flight_profile_index),
+        launch_time_utc=flight_profile.launch_time_utc,
+        times=[float(t) for t in flight_profile.times],
+        ranges_m=ranges_m,
+        azimuths_deg=azimuths_deg,
+        elevations_deg=elevations_deg,
+    )
+
+
+def compute_node_observations_batch(flight_profiles, ground_nodes, terrain):
+    results = []
+    for i, fp in enumerate(flight_profiles):
+        if fp is None:
+            continue
+        for node in ground_nodes:
+            results.append(
+                compute_node_observations(
+                    flight_profile=fp,
+                    node=node,
+                    terrain=terrain,
+                    flight_profile_index=i,
+                )
+            )
+    return results
 
 class Model:
     helium_mm = 4.002602

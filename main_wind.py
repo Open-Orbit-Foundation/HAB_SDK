@@ -1,4 +1,13 @@
-from model_wind import LaunchSite, Balloon, Payload, MissionProfile, Model, ETOPO1Terrain
+from model_wind import (
+    LaunchSite,
+    Balloon,
+    Payload,
+    MissionProfile,
+    Model,
+    ETOPO1Terrain,
+    GroundNode,
+    compute_node_observations_batch,
+)
 from gfs_wind import GFSWind
 from hrrr_wind import HRRRWind
 import numpy as np
@@ -340,10 +349,20 @@ if __name__ == "__main__":
                 )
             )
 
+    ground_nodes = [
+        GroundNode(
+            latitude=40.446387,
+            longitude=-104.637853,
+            altitude=None,
+            name="Launch Site GS",
+        ),
+    ]
+
     # ---- Wind selection ----
     # Choose ONE wind source for the whole batch run.
     WIND_KIND = "gfs"   # "gfs" or "hrrr"
     DRAW_GROUND_TRACES = False
+    DRAW_BASEMAP = True
 
     dt = 0.25
 
@@ -354,6 +373,13 @@ if __name__ == "__main__":
         use_multiprocessing=True,
         max_workers=4,
         chunk_size=10,
+    )
+
+    postprocess_terrain = ETOPO1Terrain()
+    node_observation_profiles = compute_node_observations_batch(
+        flight_profiles=flight_profiles,
+        ground_nodes=ground_nodes,
+        terrain=postprocess_terrain,
     )
 
     # ---- Post-processing ----
@@ -395,6 +421,29 @@ if __name__ == "__main__":
             "landing_longitude",
         ]])
 
+    node_df = profiles_to_dataframe([q for q in node_observation_profiles if q is not None])
+
+    if not node_df.empty:
+        print(f"Node observation profiles: {len(node_df)}")
+        print(node_df[[
+            "node_name",
+            "flight_profile_index",
+            "launch_time_utc",
+            "node_latitude",
+            "node_longitude",
+            "node_altitude",
+        ]])
+
+    obs0 = node_observation_profiles[0]
+    print(obs0.node_name)
+    print(obs0.launch_time_utc)
+    print(obs0.times[:5])
+    print(obs0.ranges_m[:5])
+    print(obs0.azimuths_deg[:5])
+    print(obs0.elevations_deg[:5])
+
+    print("test")
+    
     # ---- Launch / Burst / Landing map ----
     sane_df = df[df["sane"]].copy()
 
@@ -453,12 +502,16 @@ if __name__ == "__main__":
         ax.set_ylim(ymin, ymax)
         ax.set_aspect("equal", adjustable="box")
 
-        cx.add_basemap(
-            ax,
-            crs="EPSG:4326",
-            source=cx.providers.OpenStreetMap.Mapnik,
-            attribution_size=6,
-        )
+        if DRAW_BASEMAP:
+            try:
+                cx.add_basemap(
+                    ax,
+                    crs="EPSG:4326",
+                    source=cx.providers.OpenStreetMap.Mapnik,
+                    attribution_size=6,
+                )
+            except Exception as e:
+                print(f"Warning: basemap download failed: {e}")
 
         if DRAW_GROUND_TRACES:
             for i, fp in enumerate(sane_profiles):
