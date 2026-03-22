@@ -9,14 +9,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import sys
 import matplotlib.pyplot as plt
 import contextily as cx
+from datetime import datetime, timedelta, timezone
 
 pd.set_option('display.max_rows', None)
+
+#cloc . --exclude-dir=__pycache__,.vscode,gfs_downloads,hrrr_downloads,mission_design_spaces,terrain_cache,.git
 
 # Worker-local caches so each process only builds terrain / wind once.
 _WORKER_TERRAIN = None
 _WORKER_WIND = None
 _WORKER_SIG = None
-
 
 def extract_attributes(obj, prefix=""):
     attributes = {}
@@ -29,7 +31,6 @@ def extract_attributes(obj, prefix=""):
             else:
                 attributes[f"{prefix}{attr}"] = value
     return attributes
-
 
 def profiles_to_dataframe(profiles):
     profile_data = []
@@ -56,20 +57,51 @@ def mp_progress(done, total, start, bar_len=60):
     )
     sys.stdout.flush()
 
+def parse_utc_time(t):
+    if isinstance(t, str):
+        return datetime.strptime(t, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    return t
 
+def format_utc_time(t):
+    return t.strftime("%Y-%m-%d %H:%M")
 
-def chunked_indexed(profiles, chunk_size: int):
-    """Yield lists of (idx, profile) of length <= chunk_size."""
-    batch = []
-    for i, p in enumerate(profiles):
-        batch.append((i, p))
-        if len(batch) >= chunk_size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
+def nominal_cycle_time_utc(wind_kind: str, launch_time_utc):
+    t = parse_utc_time(launch_time_utc)
+    wind_kind = wind_kind.strip().lower()
 
+    if wind_kind == "gfs":
+        cycle_hour = (t.hour // 6) * 6
+        cycle = t.replace(hour=cycle_hour, minute=0, second=0, microsecond=0)
+        return cycle
 
+    if wind_kind == "hrrr":
+        cycle = t.replace(minute=0, second=0, microsecond=0)
+        return cycle
+
+    raise ValueError(f"Unsupported wind_kind: {wind_kind}")
+
+def resolve_wind_cycle_time_utc(wind_kind: str, launch_time_utc, terrain=None):
+    last_error = None
+
+    for cycle_time_utc in cycle_candidates_utc(wind_kind, launch_time_utc):
+        try:
+            wind = build_wind(wind_kind, cycle_time_utc)
+            return cycle_time_utc, wind
+        except Exception as e:
+            last_error = e
+
+    raise RuntimeError(
+        f"Could not build {wind_kind} wind for launch_time_utc={launch_time_utc}"
+    ) from last_error
+
+def cycle_candidates_utc(wind_kind: str, launch_time_utc, max_fallbacks=4):
+    nominal = nominal_cycle_time_utc(wind_kind, launch_time_utc)
+    wind_kind = wind_kind.strip().lower()
+
+    step = timedelta(hours=6) if wind_kind == "gfs" else timedelta(hours=1)
+
+    for k in range(max_fallbacks + 1):
+        yield format_utc_time(nominal - k * step)
 
 def build_wind(wind_kind: str, run_time_utc: str):
     wind_kind = wind_kind.strip().lower()
@@ -112,26 +144,31 @@ def build_wind(wind_kind: str, run_time_utc: str):
 
     raise ValueError(f"Unsupported wind_kind: {wind_kind}")
 
-
-
-def get_worker_resources(wind_kind: str, run_time_utc: str):
+def get_worker_resources(wind_kind: str, launch_time_utc):
     global _WORKER_TERRAIN, _WORKER_WIND, _WORKER_SIG
 
-    sig = (wind_kind.strip().lower(), str(run_time_utc))
-    if _WORKER_SIG != sig or _WORKER_TERRAIN is None or _WORKER_WIND is None:
+    nominal_cycle = format_utc_time(nominal_cycle_time_utc(wind_kind, launch_time_utc))
+
+    if _WORKER_TERRAIN is None:
         _WORKER_TERRAIN = ETOPO1Terrain()
-        _WORKER_WIND = build_wind(wind_kind, run_time_utc)
-        _WORKER_SIG = sig
+
+    if (
+        _WORKER_WIND is None
+        or _WORKER_SIG is None
+        or _WORKER_SIG[0] != wind_kind.strip().lower()
+        or _WORKER_SIG[1] != nominal_cycle
+    ):
+        resolved_cycle, wind = resolve_wind_cycle_time_utc(wind_kind, launch_time_utc)
+        _WORKER_WIND = wind
+        _WORKER_SIG = (wind_kind.strip().lower(), nominal_cycle, resolved_cycle)
 
     return _WORKER_TERRAIN, _WORKER_WIND
 
-
-
-def predictor_batch(batch, dt, wind_kind, run_time_utc, logging=False):
-    terrain, wind = get_worker_resources(wind_kind, run_time_utc)
-
+def predictor_batch(batch, dt, wind_kind, logging=False):
     pairs = []
     for idx, profile in batch:
+        terrain, wind = get_worker_resources(wind_kind, profile.launch_time_utc)
+
         out = []
         try:
             Model(
@@ -140,7 +177,7 @@ def predictor_batch(batch, dt, wind_kind, run_time_utc, logging=False):
                 result=out,
                 wind=wind,
                 terrain=terrain,
-                run_time_utc=run_time_utc,
+                run_time_utc=profile.launch_time_utc,
             ).altitude_model(logging=logging)
             prof = out[0] if out else None
         except Exception:
@@ -150,78 +187,78 @@ def predictor_batch(batch, dt, wind_kind, run_time_utc, logging=False):
 
     return pairs
 
+def profile_batch_key(profile, wind_kind: str):
+    nominal_cycle = format_utc_time(
+        nominal_cycle_time_utc(wind_kind, profile.launch_time_utc)
+    )
+    return (wind_kind.strip().lower(), nominal_cycle)
+
+def grouped_indexed_profiles(profiles, wind_kind: str):
+    groups = {}
+    for idx, profile in enumerate(profiles):
+        key = profile_batch_key(profile, wind_kind)
+        groups.setdefault(key, []).append((idx, profile))
+    return groups
+
+def chunk_group(group, chunk_size: int):
+    batch = []
+    for item in group:
+        batch.append(item)
+        if len(batch) >= chunk_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
 def wrap_lon_180(lon_deg):
     return ((float(lon_deg) + 180.0) % 360.0) - 180.0
 
-if __name__ == "__main__":
-    # ---- Mission setup ----
-    launch_site = LaunchSite(40.446387, -104.637853)
-
-    fill_volumes = [150] #np.linspace(0, 300, 251)
-
-    mission_profiles = []
-    for v_fill in fill_volumes:
-        b = Balloon(0.60, 6.02, 0.55, "Helium", float(v_fill))  # Kaymont 600g
-        # b = Balloon(0.80, 7.00, 0.55, "Helium", float(v_fill))  # Kaymont 800g
-        # b = Balloon(1.00, 7.86, 0.55, "Helium", float(v_fill))  # Kaymont 1000g
-        # b = Balloon(1.20, 8.63, 0.55, "Helium", float(v_fill))  # Kaymont 1200g
-        # b = Balloon(1.50, 9.44, 0.55, "Helium", float(v_fill))  # Kaymont 1500g
-        # b = Balloon(2.00, 10.54, 0.55, "Helium", float(v_fill)) # Kaymont 2000g
-        # b = Balloon(3.00, 13.00, 0.55, "Helium", float(v_fill)) # Kaymont 3000g
-        #b = Balloon(4.00, 15.06, 0.55, "Helium", float(v_fill))   # Kaymont 4000g
-        p = Payload(2, 4 * 0.3048, 0.5)
-        mission_profiles.append(MissionProfile(launch_site, b, p))
-
+def run_profiles(
+    mission_profiles,
+    dt,
+    wind_kind,
+    use_multiprocessing=False,
+    max_workers=4,
+    chunk_size=10,
+):
     flight_profiles = [None] * len(mission_profiles)
 
-    # ---- Wind selection ----
-    # Choose ONE wind source for the whole batch run.
-    WIND_KIND = "gfs"   # "gfs" or "hrrr"
-    RUN_TIME_UTC = "2026-01-10 00:00"
+    groups = grouped_indexed_profiles(mission_profiles, wind_kind)
+    batches = []
+    for group in groups.values():
+        batches.extend(chunk_group(group, chunk_size))
 
-    dt = 0.25
-
-    # ============================================================
-    # SINGLEPROCESSING
-    # Comment out this block if you want multiprocessing instead.
-    # ============================================================
-    start = time.perf_counter()
-
-    terrain = ETOPO1Terrain()
-    wind = build_wind(WIND_KIND, RUN_TIME_UTC)
-
-    Model(
-        time_step=dt,
-        profiles=mission_profiles,
-        result=flight_profiles,
-        wind=wind,
-        terrain=terrain,
-        run_time_utc=RUN_TIME_UTC,
-    ).altitude_model(logging=True)
-
-    end = time.perf_counter()
-    print(f"Singleprocessing {len(mission_profiles)} profiles in {end - start:.2f} seconds.")
-
-    # ============================================================
-    # BATCHED MULTIPROCESSING
-    # Comment out this block if you want singleprocessing instead.
-    # ============================================================
-    '''max_workers = 4
-    CHUNK_SIZE = 10
-
-    batches = list(chunked_indexed(mission_profiles, CHUNK_SIZE))
     total = len(mission_profiles)
-    done = 0
-
     start = time.perf_counter()
+
+    if not use_multiprocessing:
+        done = 0
+        for batch in batches:
+            pairs = predictor_batch(
+                batch,
+                dt=dt,
+                wind_kind=wind_kind,
+                logging=False,
+            )
+            for idx, prof in pairs:
+                flight_profiles[idx] = prof
+            done += len(pairs)
+            mp_progress(done, total, start)
+
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        end = time.perf_counter()
+        print(f"Singleprocessing {total} profiles in {end - start:.2f} seconds.")
+        return flight_profiles
+
+    done = 0
     mp_progress(0, total, start)
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         submit = partial(
             predictor_batch,
             dt=dt,
-            wind_kind=WIND_KIND,
-            run_time_utc=RUN_TIME_UTC,
+            wind_kind=wind_kind,
             logging=False,
         )
         futures = [executor.submit(submit, batch) for batch in batches]
@@ -233,10 +270,91 @@ if __name__ == "__main__":
             done += len(pairs)
             mp_progress(done, total, start)
 
-    end = time.perf_counter()
     sys.stdout.write("\n")
     sys.stdout.flush()
-    print(f"Multiprocessing {total} profiles in {end - start:.2f} seconds.")'''
+    end = time.perf_counter()
+    print(f"Multiprocessing {total} profiles in {end - start:.2f} seconds.")
+    return flight_profiles
+
+def expand_bounds_to_aspect(xmin, xmax, ymin, ymax, width, height):
+    xspan = max(xmax - xmin, 1e-9)
+    yspan = max(ymax - ymin, 1e-9)
+
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+
+    target_aspect = width / height
+    data_aspect = xspan / yspan
+
+    if data_aspect < target_aspect:
+        # too tall/narrow -> expand x
+        new_xspan = yspan * target_aspect
+        xmin = cx - 0.5 * new_xspan
+        xmax = cx + 0.5 * new_xspan
+    else:
+        # too wide/short -> expand y
+        new_yspan = xspan / target_aspect
+        ymin = cy - 0.5 * new_yspan
+        ymax = cy + 0.5 * new_yspan
+
+    return xmin, xmax, ymin, ymax
+
+def time_range_utc_minutes(start, end, step_minutes):
+    t0 = parse_utc_time(start)
+    t1 = parse_utc_time(end)
+
+    times = []
+    t = t0
+    while t <= t1:
+        times.append(format_utc_time(t))
+        t += timedelta(minutes=step_minutes)
+
+    return times
+
+if __name__ == "__main__":
+    # ---- Mission setup ----
+    launch_site = LaunchSite(40.446387, -104.637853)
+
+    fill_volumes = [150] #np.linspace(0, 300, 251)
+
+    launch_times_utc = time_range_utc_minutes("2026-03-19 00:00", "2026-03-19 12:00", 30)
+
+    mission_profiles = []
+    for launch_time_utc in launch_times_utc:
+        for v_fill in fill_volumes:
+            b = Balloon(0.60, 6.02, 0.55, "Helium", float(v_fill))  # Kaymont 600g
+            # b = Balloon(0.80, 7.00, 0.55, "Helium", float(v_fill))  # Kaymont 800g
+            # b = Balloon(1.00, 7.86, 0.55, "Helium", float(v_fill))  # Kaymont 1000g
+            # b = Balloon(1.20, 8.63, 0.55, "Helium", float(v_fill))  # Kaymont 1200g
+            # b = Balloon(1.50, 9.44, 0.55, "Helium", float(v_fill))  # Kaymont 1500g
+            # b = Balloon(2.00, 10.54, 0.55, "Helium", float(v_fill)) # Kaymont 2000g
+            # b = Balloon(3.00, 13.00, 0.55, "Helium", float(v_fill)) # Kaymont 3000g
+            #b = Balloon(4.00, 15.06, 0.55, "Helium", float(v_fill))   # Kaymont 4000g
+            p = Payload(2, 4 * 0.3048, 0.5)
+            mission_profiles.append(
+                MissionProfile(
+                    launch_site=launch_site,
+                    balloon=b,
+                    payload=p,
+                    launch_time_utc=launch_time_utc,
+                )
+            )
+
+    # ---- Wind selection ----
+    # Choose ONE wind source for the whole batch run.
+    WIND_KIND = "gfs"   # "gfs" or "hrrr"
+    DRAW_GROUND_TRACES = False
+
+    dt = 0.25
+
+    flight_profiles = run_profiles(
+        mission_profiles=mission_profiles,
+        dt=dt,
+        wind_kind=WIND_KIND,
+        use_multiprocessing=True,
+        max_workers=4,
+        chunk_size=10,
+    )
 
     # ---- Post-processing ----
     df = profiles_to_dataframe([p for p in flight_profiles if p is not None])
@@ -258,6 +376,8 @@ if __name__ == "__main__":
         df["landing_longitude"] = [wrap_lon_180(fp.longitudes[-1]) for fp in flight_profiles if fp is not None]
         df["landing_altitude"] = [fp.altitudes[-1] for fp in flight_profiles if fp is not None]
         df["landing_ground_altitude"] = [fp.ground_altitudes[-1] for fp in flight_profiles if fp is not None]
+        df["burst_latitude"] = [fp.burst_latitude for fp in flight_profiles if fp is not None]
+        df["burst_longitude"] = [wrap_lon_180(fp.burst_longitude) for fp in flight_profiles if fp is not None]
 
         print(f"Total profiles: {len(df)}")
         print(f"Successful bursts: {int(df['ok_burst'].sum())}")
@@ -265,56 +385,73 @@ if __name__ == "__main__":
         print(df[[
             "payload.mass",
             "balloon.gas_volume",
-            "burst_altitude",
+            "launch_time_utc",
             "burst_time",
+            "burst_altitude",
+            "burst_latitude",
+            "burst_longitude",
             "flight_time",
             "landing_latitude",
             "landing_longitude",
         ]])
 
-    # ---- Landing scatter map ----
+    # ---- Launch / Burst / Landing map ----
     sane_df = df[df["sane"]].copy()
 
     if not sane_df.empty:
-        fig, ax = plt.subplots(figsize=(10, 10))
+        fig_w, fig_h = 10, 10
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
         launch_lat = mission_profiles[0].launch_site.latitude
-        launch_lon = ((mission_profiles[0].launch_site.longitude + 180.0) % 360.0) - 180.0
+        launch_lon = wrap_lon_180(mission_profiles[0].launch_site.longitude)
 
         land_lat = sane_df["landing_latitude"].to_numpy(dtype=float)
-        land_lon = ((sane_df["landing_longitude"].to_numpy(dtype=float) + 180.0) % 360.0) - 180.0
+        land_lon = sane_df["landing_longitude"].to_numpy(dtype=float)
 
-        # Landing points: one point per run
-        ax.scatter(
-            land_lon,
-            land_lat,
-            s=30,
-            alpha=0.75,
-            label="Landing locations",
-        )
+        burst_lat = sane_df["burst_latitude"].to_numpy(dtype=float)
+        burst_lon = sane_df["burst_longitude"].to_numpy(dtype=float)
 
-        # Launch point: show once
-        ax.scatter(
-            [launch_lon],
-            [launch_lat],
-            s=120,
-            marker="*",
-            label="Launch location",
-            zorder=5,
-        )
+        sane_profiles = [
+            fp for fp, ok in zip([p for p in flight_profiles if p is not None], df["sane"].tolist())
+            if ok
+        ]
 
-        all_lon = np.concatenate([[launch_lon], land_lon])
-        all_lat = np.concatenate([[launch_lat], land_lat])
+        all_lon_parts = [[launch_lon], land_lon, burst_lon]
+        all_lat_parts = [[launch_lat], land_lat, burst_lat]
 
-        lon_span = np.ptp(all_lon)
-        lat_span = np.ptp(all_lat)
+        if DRAW_GROUND_TRACES:
+            for fp in sane_profiles:
+                trace_lon = np.array([wrap_lon_180(x) for x in fp.longitudes], dtype=float)
+                trace_lat = np.array(fp.latitudes, dtype=float)
+                all_lon_parts.append(trace_lon)
+                all_lat_parts.append(trace_lat)
 
-        # Avoid zero-span issues when points are tightly clustered
+        all_lon = np.concatenate(all_lon_parts)
+        all_lat = np.concatenate(all_lat_parts)
+
+        xmin = all_lon.min()
+        xmax = all_lon.max()
+        ymin = all_lat.min()
+        ymax = all_lat.max()
+
+        lon_span = xmax - xmin
+        lat_span = ymax - ymin
+
         lon_pad = max(0.01, 0.08 * lon_span)
         lat_pad = max(0.01, 0.08 * lat_span)
 
-        ax.set_xlim(all_lon.min() - lon_pad, all_lon.max() + lon_pad)
-        ax.set_ylim(all_lat.min() - lat_pad, all_lat.max() + lat_pad)
+        xmin -= lon_pad
+        xmax += lon_pad
+        ymin -= lat_pad
+        ymax += lat_pad
+
+        xmin, xmax, ymin, ymax = expand_bounds_to_aspect(
+            xmin, xmax, ymin, ymax, fig_w, fig_h
+        )
+
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal", adjustable="box")
 
         cx.add_basemap(
             ax,
@@ -323,7 +460,64 @@ if __name__ == "__main__":
             attribution_size=6,
         )
 
-        ax.set_title("Launch and Landing Locations")
+        if DRAW_GROUND_TRACES:
+            for i, fp in enumerate(sane_profiles):
+                trace_lon = np.array([wrap_lon_180(x) for x in fp.longitudes], dtype=float)
+                trace_lat = np.array(fp.latitudes, dtype=float)
+                ax.plot(
+                    trace_lon,
+                    trace_lat,
+                    linewidth=2.0,
+                    alpha=0.9,
+                    zorder=8,
+                    label="Ground trace" if i == 0 else None,
+                )
+
+        ax.scatter(
+            land_lon,
+            land_lat,
+            s=30,
+            alpha=0.75,
+            label="Landing locations",
+            zorder=9,
+        )
+
+        ax.scatter(
+            burst_lon,
+            burst_lat,
+            s=45,
+            marker="^",
+            alpha=0.9,
+            label="Burst locations",
+            zorder=10,
+        )
+
+        ax.scatter(
+            [launch_lon],
+            [launch_lat],
+            s=120,
+            marker="*",
+            label="Launch location",
+            zorder=11,
+        )
+
+        # ---- Time progression path (connect sequential launches) ----
+        order = sane_df.index.to_numpy()
+
+        time_land_lon = land_lon
+        time_land_lat = land_lat
+
+        ax.plot(
+            time_land_lon,
+            time_land_lat,
+            linewidth=2.5,
+            alpha=0.9,
+            color="black",
+            zorder=7,
+            label="Landing progression",
+        )
+
+        ax.set_title("Launch, Burst, and Landing Locations")
         ax.set_xlabel("Longitude (deg)")
         ax.set_ylabel("Latitude (deg)")
         ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.4)

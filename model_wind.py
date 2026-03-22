@@ -60,6 +60,7 @@ class MissionProfile:
     launch_site: LaunchSite
     balloon: Balloon
     payload: Payload
+    launch_time_utc: datetime | str
 
 
 @dataclass(frozen=False)
@@ -79,6 +80,8 @@ class FlightProfile(MissionProfile):
     wind_u: list[float]   # east (m/s)
     wind_v: list[float]   # north (m/s)
     burst_altitude: float
+    burst_latitude: float
+    burst_longitude: float
     max_altitude: float
     burst_time: float
     flight_time: float
@@ -227,6 +230,14 @@ class Model:
         if a is not None and not np.all(np.isfinite(a)):
             return False
         return True
+    
+    def _resolve_run_time_utc(self, profile):
+        run_time = profile.launch_time_utc
+
+        if isinstance(run_time, str):
+            return datetime.strptime(run_time, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+
+        return run_time
 
     # -------------------------
     # Core 3-DOF acceleration
@@ -277,6 +288,7 @@ class Model:
         start = time.perf_counter()
 
         for profile in self.profiles:
+            profile_run_time_utc = self._resolve_run_time_utc(profile)
             # Initial geographic state
             lat = float(profile.launch_site.latitude)
             lon = float(profile.launch_site.longitude)
@@ -318,12 +330,14 @@ class Model:
 
             burst_volume = (4 / 3) * math.pi * (profile.balloon.burst_diameter / 2) ** 3
             burst_altitude = None
+            burst_latitude = None
+            burst_longitude = None
             burst_time = None
 
             t = 0.0
             x_prev = y_prev = 0.0
 
-            current_time = self.run_time_utc if self.run_time_utc else None
+            current_time = profile_run_time_utc if profile_run_time_utc else None
             u_wind, v_wind = self.wind.uv(current_time, r[2], lat, lon) if self.wind else (0.0, 0.0)
             if not np.isfinite(u_wind):
                 u_wind = 0.0
@@ -346,7 +360,7 @@ class Model:
                 r_prev = r.copy()
                 v_prev = v.copy()
                 prev_ground = ground_altitudes[-1]
-                current_time = self.run_time_utc + timedelta(seconds=t) if self.run_time_utc else None
+                current_time = profile_run_time_utc + timedelta(seconds=t) if profile_run_time_utc else None
 
                 pressure, temperature, density, gravity = self.atmosphere._Qualities(r[2])
                 pressures.append(pressure)
@@ -362,6 +376,8 @@ class Model:
                     buoyant = True
                     if volume >= burst_volume:
                         burst_altitude = r[2]
+                        burst_latitude = lat
+                        burst_longitude = lon
                         burst_time = t
                         if descent_mass == 0:
                             break
@@ -436,7 +452,7 @@ class Model:
                 t += self.time_step
 
                 ground_next = self._terrain_elevation(lat, lon)
-                current_time_next = self.run_time_utc + timedelta(seconds=t) if self.run_time_utc else None
+                current_time_next = profile_run_time_utc + timedelta(seconds=t) if profile_run_time_utc else None
                 u_wind, v_wind = self.wind.uv(current_time_next, r[2], lat, lon) if self.wind else (0.0, 0.0)
                 if not np.isfinite(u_wind):
                     u_wind = 0.0
@@ -495,6 +511,7 @@ class Model:
                     profile.launch_site,
                     profile.balloon,
                     profile.payload,
+                    profile.launch_time_utc,
                     times,
                     latitudes,
                     longitudes,
@@ -510,6 +527,8 @@ class Model:
                     wind_u,
                     wind_v,
                     float("nan") if burst_altitude is None else float(burst_altitude),
+                    float("nan") if burst_latitude is None else float(burst_latitude),
+                    float("nan") if burst_longitude is None else float(_wrap_lon_180(burst_longitude)),
                     float(np.max(altitudes)),
                     float("nan") if burst_time is None else float(burst_time),
                     float(times[-1]),
