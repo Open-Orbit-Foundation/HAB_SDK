@@ -106,6 +106,7 @@ class NodeObservationProfile:
     ranges_m: list[float]
     azimuths_deg: list[float]
     elevations_deg: list[float]
+    terrain_clear: list[bool]
 
 class ConstantTerrain:
     def __init__(self, elevation_m: float):
@@ -142,7 +143,7 @@ class ETOPO1Terrain:
 
         if not self.path.exists():
             if not gz_path.exists():
-                print("Downloading ETOPO1 terrain dataset (~500 MB)...")
+                #print("Downloading ETOPO1 terrain dataset (~500 MB)...")
                 with requests.get(url, stream=True, timeout=60) as r:
                     r.raise_for_status()
                     with open(gz_path, "wb") as f:
@@ -161,7 +162,7 @@ class ETOPO1Terrain:
             except OSError:
                 pass
 
-        print("Loading ETOPO1 terrain dataset...")
+        #print("Loading ETOPO1 terrain dataset...")
         ds = xr.open_dataset(self.path)
 
         # ETOPO1 grid-registered GMT file uses x=lon, y=lat, z=elevation
@@ -283,24 +284,84 @@ def slant_range_az_el(
 
     return slant_range, azimuth_deg, elevation_deg
 
+def _shortest_dlon_deg(lon1_deg: float, lon0_deg: float) -> float:
+    return ((float(lon1_deg) - float(lon0_deg) + 180.0) % 360.0) - 180.0
+
+
+def _interp_lon_shortest(lon0_deg: float, lon1_deg: float, f: float) -> float:
+    return _wrap_lon_180(float(lon0_deg) + f * _shortest_dlon_deg(lon1_deg, lon0_deg))
+
+
+def _surface_distance_m(lat0_deg: float, lon0_deg: float, lat1_deg: float, lon1_deg: float) -> float:
+    lat0 = math.radians(float(lat0_deg))
+    lat1 = math.radians(float(lat1_deg))
+    dlat = lat1 - lat0
+    dlon = math.radians(_shortest_dlon_deg(lon1_deg, lon0_deg))
+    latm = 0.5 * (lat0 + lat1)
+
+    x = dlon * math.cos(latm)
+    y = dlat
+    return R_E * math.hypot(x, y)
+
+
+def terrain_line_of_sight_clear(
+    observer_lat_deg: float,
+    observer_lon_deg: float,
+    observer_alt_m: float,
+    target_lat_deg: float,
+    target_lon_deg: float,
+    target_alt_m: float,
+    terrain,
+    sample_step_m: float = 500.0,
+    clearance_m: float = 0.0,
+    target_elevation_deg: float | None = None,
+) -> bool:
+    if target_elevation_deg is not None and target_elevation_deg <= 0.0:
+        return False
+
+    horizontal_m = _surface_distance_m(
+        observer_lat_deg, observer_lon_deg,
+        target_lat_deg, target_lon_deg,
+    )
+
+    if horizontal_m <= 0.0:
+        return True
+
+    n_seg = max(1, int(math.ceil(horizontal_m / float(sample_step_m))))
+
+    for i in range(1, n_seg):
+        f = i / n_seg
+
+        lat = (1.0 - f) * float(observer_lat_deg) + f * float(target_lat_deg)
+        lon = _interp_lon_shortest(observer_lon_deg, target_lon_deg, f)
+        ray_alt = (1.0 - f) * float(observer_alt_m) + f * float(target_alt_m)
+
+        terrain_alt = float(terrain.elevation(lat, lon))
+        if terrain_alt + float(clearance_m) >= ray_alt:
+            return False
+
+    return True
 
 def resolve_node_altitude(node: GroundNode, terrain) -> float:
     if node.altitude is not None:
         return float(node.altitude)
     return float(terrain.elevation(node.latitude, node.longitude))
 
-
 def compute_node_observations(
     flight_profile: FlightProfile,
     node: GroundNode,
     terrain,
     flight_profile_index: int,
+    check_terrain: bool = True,
+    terrain_step_m: float = 500.0,
+    terrain_clearance_m: float = 0.0,
 ) -> NodeObservationProfile:
     node_altitude = resolve_node_altitude(node, terrain)
 
     ranges_m = []
     azimuths_deg = []
     elevations_deg = []
+    terrain_clear = []
 
     for lat, lon, alt in zip(
         flight_profile.latitudes,
@@ -315,9 +376,28 @@ def compute_node_observations(
             target_lon_deg=lon,
             target_alt_m=alt,
         )
+
         ranges_m.append(float(r))
         azimuths_deg.append(float(az))
         elevations_deg.append(float(el))
+
+        if check_terrain:
+            clear = terrain_line_of_sight_clear(
+                observer_lat_deg=node.latitude,
+                observer_lon_deg=node.longitude,
+                observer_alt_m=node_altitude,
+                target_lat_deg=lat,
+                target_lon_deg=lon,
+                target_alt_m=alt,
+                terrain=terrain,
+                sample_step_m=terrain_step_m,
+                clearance_m=terrain_clearance_m,
+                target_elevation_deg=el,
+            )
+        else:
+            clear = True
+
+        terrain_clear.append(bool(clear))
 
     return NodeObservationProfile(
         node_name=node.name,
@@ -330,10 +410,18 @@ def compute_node_observations(
         ranges_m=ranges_m,
         azimuths_deg=azimuths_deg,
         elevations_deg=elevations_deg,
+        terrain_clear=terrain_clear,
     )
 
 
-def compute_node_observations_batch(flight_profiles, ground_nodes, terrain):
+def compute_node_observations_batch(
+    flight_profiles,
+    ground_nodes,
+    terrain,
+    check_terrain: bool = True,
+    terrain_step_m: float = 500.0,
+    terrain_clearance_m: float = 0.0,
+):
     results = []
     for i, fp in enumerate(flight_profiles):
         if fp is None:
@@ -345,6 +433,9 @@ def compute_node_observations_batch(flight_profiles, ground_nodes, terrain):
                     node=node,
                     terrain=terrain,
                     flight_profile_index=i,
+                    check_terrain=check_terrain,
+                    terrain_step_m=terrain_step_m,
+                    terrain_clearance_m=terrain_clearance_m,
                 )
             )
     return results

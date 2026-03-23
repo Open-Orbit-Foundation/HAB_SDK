@@ -19,6 +19,8 @@ import sys
 import matplotlib.pyplot as plt
 import contextily as cx
 from datetime import datetime, timedelta, timezone
+import os
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 pd.set_option('display.max_rows', None)
 
@@ -89,12 +91,12 @@ def nominal_cycle_time_utc(wind_kind: str, launch_time_utc):
 
     raise ValueError(f"Unsupported wind_kind: {wind_kind}")
 
-def resolve_wind_cycle_time_utc(wind_kind: str, launch_time_utc, terrain=None):
+def resolve_wind_cycle_time_utc(wind_kind: str, launch_time_utc, wind_verbose: bool = True):
     last_error = None
 
     for cycle_time_utc in cycle_candidates_utc(wind_kind, launch_time_utc):
         try:
-            wind = build_wind(wind_kind, cycle_time_utc)
+            wind = build_wind(wind_kind, cycle_time_utc, wind_verbose=wind_verbose)
             return cycle_time_utc, wind
         except Exception as e:
             last_error = e
@@ -112,7 +114,7 @@ def cycle_candidates_utc(wind_kind: str, launch_time_utc, max_fallbacks=4):
     for k in range(max_fallbacks + 1):
         yield format_utc_time(nominal - k * step)
 
-def build_wind(wind_kind: str, run_time_utc: str):
+def build_wind(wind_kind: str, run_time_utc: str, wind_verbose: bool = True):
     wind_kind = wind_kind.strip().lower()
 
     if wind_kind == "gfs":
@@ -125,6 +127,7 @@ def build_wind(wind_kind: str, run_time_utc: str):
             sample_time_bin_s=60.0,
             sample_alt_bin_m=100.0,
             sample_latlon_decimals=6,
+            verbose=wind_verbose,
         )
 
     if wind_kind == "hrrr":
@@ -137,6 +140,7 @@ def build_wind(wind_kind: str, run_time_utc: str):
             sample_time_bin_s=60.0,
             sample_alt_bin_m=100.0,
             sample_latlon_decimals=6,
+            verbose=wind_verbose,
         )
         return HRRRWind(
             run_utc=run_time_utc,
@@ -148,12 +152,12 @@ def build_wind(wind_kind: str, run_time_utc: str):
             sample_time_bin_s=60.0,
             sample_alt_bin_m=100.0,
             sample_latlon_decimals=6,
-            verbose=False,
+            verbose=wind_verbose,
         )
 
     raise ValueError(f"Unsupported wind_kind: {wind_kind}")
 
-def get_worker_resources(wind_kind: str, launch_time_utc):
+def get_worker_resources(wind_kind: str, launch_time_utc, wind_verbose: bool = True):
     global _WORKER_TERRAIN, _WORKER_WIND, _WORKER_SIG
 
     nominal_cycle = format_utc_time(nominal_cycle_time_utc(wind_kind, launch_time_utc))
@@ -167,16 +171,16 @@ def get_worker_resources(wind_kind: str, launch_time_utc):
         or _WORKER_SIG[0] != wind_kind.strip().lower()
         or _WORKER_SIG[1] != nominal_cycle
     ):
-        resolved_cycle, wind = resolve_wind_cycle_time_utc(wind_kind, launch_time_utc)
+        resolved_cycle, wind = resolve_wind_cycle_time_utc(wind_kind, launch_time_utc,wind_verbose=wind_verbose)
         _WORKER_WIND = wind
         _WORKER_SIG = (wind_kind.strip().lower(), nominal_cycle, resolved_cycle)
 
     return _WORKER_TERRAIN, _WORKER_WIND
 
-def predictor_batch(batch, dt, wind_kind, logging=False):
+def predictor_batch(batch, dt, wind_kind, logging=False, wind_verbose=True):
     pairs = []
     for idx, profile in batch:
-        terrain, wind = get_worker_resources(wind_kind, profile.launch_time_utc)
+        terrain, wind = get_worker_resources(wind_kind, profile.launch_time_utc,wind_verbose=wind_verbose)
 
         out = []
         try:
@@ -229,6 +233,7 @@ def run_profiles(
     use_multiprocessing=False,
     max_workers=4,
     chunk_size=10,
+    wind_verbose=True,
 ):
     flight_profiles = [None] * len(mission_profiles)
 
@@ -248,6 +253,7 @@ def run_profiles(
                 dt=dt,
                 wind_kind=wind_kind,
                 logging=False,
+                wind_verbose=wind_verbose,
             )
             for idx, prof in pairs:
                 flight_profiles[idx] = prof
@@ -269,6 +275,7 @@ def run_profiles(
             dt=dt,
             wind_kind=wind_kind,
             logging=False,
+            wind_verbose=wind_verbose,
         )
         futures = [executor.submit(submit, batch) for batch in batches]
 
@@ -320,34 +327,211 @@ def time_range_utc_minutes(start, end, step_minutes):
 
     return times
 
+def sample_series_index(times_s, t_query_s):
+    if t_query_s <= times_s[0]:
+        return 0
+    if t_query_s >= times_s[-1]:
+        return len(times_s) - 1
+    return int(np.searchsorted(times_s, t_query_s, side="right") - 1)
+
+
+def make_single_flight_gif(
+    flight_profile,
+    node_observation_profiles,
+    mission_profiles,
+    draw_basemap=True,
+    output_path="flight_animation.gif",
+    seconds_per_frame=300.0,
+    fps=20,
+    fig_w=10,
+    fig_h=10,
+):
+    trace_lon = np.array([wrap_lon_180(x) for x in flight_profile.longitudes], dtype=float)
+    trace_lat = np.array(flight_profile.latitudes, dtype=float)
+    burst_lon = wrap_lon_180(flight_profile.burst_longitude)
+    burst_lat = float(flight_profile.burst_latitude)
+    land_lon = wrap_lon_180(flight_profile.longitudes[-1])
+    land_lat = float(flight_profile.latitudes[-1])
+
+    launch_lat = mission_profiles[0].launch_site.latitude
+    launch_lon = wrap_lon_180(mission_profiles[0].launch_site.longitude)
+
+    node_lons = np.array([wrap_lon_180(obs.node_longitude) for obs in node_observation_profiles], dtype=float)
+    node_lats = np.array([float(obs.node_latitude) for obs in node_observation_profiles], dtype=float)
+
+    all_lon = np.concatenate([[launch_lon, burst_lon, land_lon], trace_lon, node_lons])
+    all_lat = np.concatenate([[launch_lat, burst_lat, land_lat], trace_lat, node_lats])
+
+    xmin = all_lon.min()
+    xmax = all_lon.max()
+    ymin = all_lat.min()
+    ymax = all_lat.max()
+
+    lon_span = xmax - xmin
+    lat_span = ymax - ymin
+
+    lon_pad = max(0.01, 0.08 * lon_span)
+    lat_pad = max(0.01, 0.08 * lat_span)
+
+    xmin -= lon_pad
+    xmax += lon_pad
+    ymin -= lat_pad
+    ymax += lat_pad
+
+    xmin, xmax, ymin, ymax = expand_bounds_to_aspect(
+        xmin, xmax, ymin, ymax, fig_w, fig_h
+    )
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal", adjustable="box")
+
+    if draw_basemap:
+        try:
+            cx.add_basemap(
+                ax,
+                crs="EPSG:4326",
+                source=cx.providers.OpenStreetMap.Mapnik,
+                attribution_size=6,
+            )
+        except Exception as e:
+            print(f"Warning: basemap download failed: {e}")
+
+    # static markers
+    ax.scatter(
+        [land_lon],
+        [land_lat],
+        s=30,
+        alpha=0.75,
+        label="Landing location",
+        zorder=9,
+    )
+
+    ax.scatter(
+        [burst_lon],
+        [burst_lat],
+        s=45,
+        marker="^",
+        alpha=0.9,
+        label="Burst location",
+        zorder=10,
+    )
+
+    ax.scatter(
+        [launch_lon],
+        [launch_lat],
+        s=120,
+        marker="*",
+        label="Launch location",
+        zorder=11,
+    )
+
+    ax.scatter(
+        node_lons,
+        node_lats,
+        s=60,
+        marker="s",
+        alpha=0.9,
+        label="Ground nodes",
+        zorder=11,
+    )
+
+    # animated artists
+    path_line, = ax.plot([], [], linewidth=2.5, color="black", zorder=12, label="Flight path")
+    current_dot, = ax.plot([], [], marker="o", markersize=8, color="black", zorder=13)
+
+    link_lines = []
+    for _ in node_observation_profiles:
+        line, = ax.plot([], [], linewidth=2.0, zorder=8)
+        link_lines.append(line)
+
+    ax.set_title("Launch, Burst, and Landing Locations")
+    ax.set_xlabel("Longitude (deg)")
+    ax.set_ylabel("Latitude (deg)")
+    ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.4)
+    ax.set_axisbelow(True)
+    ax.legend()
+
+    flight_times = np.array(flight_profile.times, dtype=float)
+    t_end = float(flight_times[-1])
+    frame_times = np.arange(0.0, t_end + seconds_per_frame, seconds_per_frame)
+    if frame_times[-1] < t_end:
+        frame_times = np.append(frame_times, t_end)
+
+    def init():
+        path_line.set_data([], [])
+        current_dot.set_data([], [])
+        for line in link_lines:
+            line.set_data([], [])
+        return [path_line, current_dot, *link_lines]
+
+    def update(frame_idx):
+        t_now = float(frame_times[frame_idx])
+        i = sample_series_index(flight_times, t_now)
+
+        path_line.set_data(trace_lon[: i + 1], trace_lat[: i + 1])
+        current_dot.set_data([trace_lon[i]], [trace_lat[i]])
+
+        for obs, line in zip(node_observation_profiles, link_lines):
+            j = sample_series_index(np.array(obs.times, dtype=float), t_now)
+
+            x0 = wrap_lon_180(obs.node_longitude)
+            y0 = float(obs.node_latitude)
+            x1 = trace_lon[i]
+            y1 = trace_lat[i]
+
+            line.set_data([x0, x1], [y0, y1])
+            line.set_color("green" if obs.terrain_clear[j] else "red")
+
+        ax.set_title(
+            f"Launch, Burst, and Landing Locations\n"
+            f"T+{t_now/60.0:.1f} min"
+        )
+
+        return [path_line, current_dot, *link_lines]
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        init_func=init,
+        frames=len(frame_times),
+        interval=1000.0 / fps,
+        blit=False,
+        repeat=False,
+    )
+
+    anim.save(output_path, writer=PillowWriter(fps=fps))
+    plt.close(fig)
+
 if __name__ == "__main__":
     # ---- Mission setup ----
     launch_site = LaunchSite(40.446387, -104.637853)
 
     fill_volumes = [150] #np.linspace(0, 300, 251)
 
-    launch_times_utc = time_range_utc_minutes("2026-03-19 00:00", "2026-03-19 12:00", 30)
+    launch_times_utc = "2026-03-24 00:00" #time_range_utc_minutes("2026-03-19 00:00", "2026-03-19 12:00", 30)
 
     mission_profiles = []
-    for launch_time_utc in launch_times_utc:
-        for v_fill in fill_volumes:
-            b = Balloon(0.60, 6.02, 0.55, "Helium", float(v_fill))  # Kaymont 600g
-            # b = Balloon(0.80, 7.00, 0.55, "Helium", float(v_fill))  # Kaymont 800g
-            # b = Balloon(1.00, 7.86, 0.55, "Helium", float(v_fill))  # Kaymont 1000g
-            # b = Balloon(1.20, 8.63, 0.55, "Helium", float(v_fill))  # Kaymont 1200g
-            # b = Balloon(1.50, 9.44, 0.55, "Helium", float(v_fill))  # Kaymont 1500g
-            # b = Balloon(2.00, 10.54, 0.55, "Helium", float(v_fill)) # Kaymont 2000g
-            # b = Balloon(3.00, 13.00, 0.55, "Helium", float(v_fill)) # Kaymont 3000g
-            #b = Balloon(4.00, 15.06, 0.55, "Helium", float(v_fill))   # Kaymont 4000g
-            p = Payload(2, 4 * 0.3048, 0.5)
-            mission_profiles.append(
-                MissionProfile(
-                    launch_site=launch_site,
-                    balloon=b,
-                    payload=p,
-                    launch_time_utc=launch_time_utc,
-                )
+    #for launch_time_utc in launch_times_utc:
+    for v_fill in fill_volumes:
+        b = Balloon(0.60, 6.02, 0.55, "Helium", float(v_fill))  # Kaymont 600g
+        # b = Balloon(0.80, 7.00, 0.55, "Helium", float(v_fill))  # Kaymont 800g
+        # b = Balloon(1.00, 7.86, 0.55, "Helium", float(v_fill))  # Kaymont 1000g
+        # b = Balloon(1.20, 8.63, 0.55, "Helium", float(v_fill))  # Kaymont 1200g
+        # b = Balloon(1.50, 9.44, 0.55, "Helium", float(v_fill))  # Kaymont 1500g
+        # b = Balloon(2.00, 10.54, 0.55, "Helium", float(v_fill)) # Kaymont 2000g
+        # b = Balloon(3.00, 13.00, 0.55, "Helium", float(v_fill)) # Kaymont 3000g
+        #b = Balloon(4.00, 15.06, 0.55, "Helium", float(v_fill))   # Kaymont 4000g
+        p = Payload(2, 4 * 0.3048, 0.5)
+        mission_profiles.append(
+            MissionProfile(
+                launch_site=launch_site,
+                balloon=b,
+                payload=p,
+                launch_time_utc=launch_times_utc,
             )
+        )
 
     ground_nodes = [
         GroundNode(
@@ -356,13 +540,45 @@ if __name__ == "__main__":
             altitude=None,
             name="Launch Site GS",
         ),
+        GroundNode(
+            latitude=40.575846,
+            longitude=-105.082805,
+            altitude=None,
+            name="CSU Engineering GS",
+        ),
     ]
 
+    '''GroundNode(
+        latitude=40.265453,
+        longitude=-103.640109,
+        altitude=None,
+        name="Brush Love's Gas Station",
+    ),
+    GroundNode(
+        latitude=39.741689,
+        longitude=-104.434049,
+        altitude=None,
+        name="Bennett Love's Gas Station",
+    ),'''
+    
     # ---- Wind selection ----
     # Choose ONE wind source for the whole batch run.
     WIND_KIND = "gfs"   # "gfs" or "hrrr"
     DRAW_GROUND_TRACES = False
     DRAW_BASEMAP = True
+    WIND_VERBOSE = False
+    CHECK_NODE_TERRAIN_LOS = True
+    NODE_TERRAIN_STEP_M = 500.0
+    NODE_TERRAIN_CLEARANCE_M = 0.0
+
+    MAKE_SINGLE_FLIGHT_GIF = True
+    GIF_PROFILE_INDEX = 0
+    GIF_SECONDS_PER_FRAME = 60.0
+    GIF_FPS = 20
+    GIF_OUTPUT_PATH = "flight_animation2.gif"
+
+    if not WIND_VERBOSE:
+        os.environ["HERBIE_VERBOSE"] = "false"
 
     dt = 0.25
 
@@ -370,9 +586,10 @@ if __name__ == "__main__":
         mission_profiles=mission_profiles,
         dt=dt,
         wind_kind=WIND_KIND,
-        use_multiprocessing=True,
+        use_multiprocessing=False,
         max_workers=4,
         chunk_size=10,
+        wind_verbose=WIND_VERBOSE,
     )
 
     postprocess_terrain = ETOPO1Terrain()
@@ -380,6 +597,9 @@ if __name__ == "__main__":
         flight_profiles=flight_profiles,
         ground_nodes=ground_nodes,
         terrain=postprocess_terrain,
+        check_terrain=CHECK_NODE_TERRAIN_LOS,
+        terrain_step_m=NODE_TERRAIN_STEP_M,
+        terrain_clearance_m=NODE_TERRAIN_CLEARANCE_M,
     )
 
     # ---- Post-processing ----
@@ -433,16 +653,6 @@ if __name__ == "__main__":
             "node_longitude",
             "node_altitude",
         ]])
-
-    obs0 = node_observation_profiles[0]
-    print(obs0.node_name)
-    print(obs0.launch_time_utc)
-    print(obs0.times[:5])
-    print(obs0.ranges_m[:5])
-    print(obs0.azimuths_deg[:5])
-    print(obs0.elevations_deg[:5])
-
-    print("test")
     
     # ---- Launch / Burst / Landing map ----
     sane_df = df[df["sane"]].copy()
@@ -579,3 +789,25 @@ if __name__ == "__main__":
 
         plt.tight_layout()
         plt.show()
+
+    if MAKE_SINGLE_FLIGHT_GIF:
+        fp = flight_profiles[GIF_PROFILE_INDEX]
+
+        if fp is not None:
+            obs_for_fp = [
+                obs for obs in node_observation_profiles
+                if obs.flight_profile_index == GIF_PROFILE_INDEX
+            ]
+
+            make_single_flight_gif(
+                flight_profile=fp,
+                node_observation_profiles=obs_for_fp,
+                mission_profiles=mission_profiles,
+                draw_basemap=DRAW_BASEMAP,
+                output_path=GIF_OUTPUT_PATH,
+                seconds_per_frame=GIF_SECONDS_PER_FRAME,
+                fps=GIF_FPS,
+                fig_w=10,
+                fig_h=10,
+            )
+            print(f"Saved GIF to {GIF_OUTPUT_PATH}")
