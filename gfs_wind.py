@@ -128,7 +128,9 @@ class GFSWind:
         # ---- cache sizes ----
         sample_cache_max: int = 200000,
         grid_cache_max: int = 50000,
+        verbose: bool = False,
     ):
+        self.verbose = bool(verbose)
         # Resolve run time.
         # - If run_utc is None or 'latest', use a safe "latest available" run (with lag buffer).
         # - If run_utc is in the future, optionally clamp it back to the latest available run.
@@ -418,6 +420,7 @@ class GFSWind:
             product=self.product,
             fxx=fxx,
             save_dir=str(self.save_dir),
+            verbose=self.verbose,
         )
         H.download(search=search)
         ds = H.xarray(search=search, decode_timedelta=False, remove_grib=False)

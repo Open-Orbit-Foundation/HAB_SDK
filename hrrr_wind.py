@@ -362,6 +362,7 @@ class HRRRWind:
             product=self.product,
             fxx=fxx,
             save_dir=str(self.save_dir),
+            verbose=self.verbose,
         )
         H.download(search=search)
         ds = H.xarray(search=search, decode_timedelta=False, remove_grib=False)
